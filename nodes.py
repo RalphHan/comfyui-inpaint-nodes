@@ -98,6 +98,7 @@ def inject_patched_calculate_weight():
         injected_model_patcher_calculate_weight = True
 
 
+model_cahce = {}
 class LoadFooocusInpaint:
     @classmethod
     def INPUT_TYPES(s):
@@ -113,6 +114,10 @@ class LoadFooocusInpaint:
     FUNCTION = "load"
 
     def load(self, head: str, patch: str):
+        model_key = (type(self), head, patch)
+        if model_key in model_cahce:
+            return model_cahce[model_key]
+
         head_file = folder_paths.get_full_path("inpaint", head)
         inpaint_head_model = InpaintHead()
         sd = torch.load(head_file, map_location="cpu")
@@ -120,6 +125,8 @@ class LoadFooocusInpaint:
 
         patch_file = folder_paths.get_full_path("inpaint", patch)
         inpaint_lora = comfy.utils.load_torch_file(patch_file, safe_load=True)
+
+        model_cahce[model_key] = ((inpaint_head_model, inpaint_lora),)
 
         return ((inpaint_head_model, inpaint_lora),)
 
@@ -304,6 +311,10 @@ class LoadInpaintModel:
     FUNCTION = "load"
 
     def load(self, model_name: str):
+        model_key = (type(self), model_name)
+        if model_key in model_cahce:
+            return model_cahce[model_key]
+
         model_file = folder_paths.get_full_path("inpaint", model_name)
         if model_file is None:
             raise RuntimeError(f"Model file not found: {model_name}")
@@ -317,6 +328,9 @@ class LoadInpaintModel:
         else:
             model = comfy_extras.chainner_models.model_loading.load_state_dict(sd)
         model = model.eval()
+
+        model_cahce[model_key] = (model,)
+
         return (model,)
 
 
