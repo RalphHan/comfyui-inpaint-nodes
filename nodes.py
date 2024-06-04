@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.jit
 import torch.nn.functional as F
+
 from torch import Tensor
 from tqdm import trange
 
@@ -11,8 +12,6 @@ from comfy.utils import ProgressBar
 from comfy.model_patcher import ModelPatcher
 from comfy.model_base import BaseModel
 from comfy.model_management import cast_to_device, get_torch_device
-from comfy_extras.chainner_models.types import PyTorchModel
-import comfy_extras.chainner_models.model_loading
 import comfy.utils
 import comfy.lora
 import folder_paths
@@ -314,6 +313,7 @@ class LoadInpaintModel:
         model_key = (type(self), model_name)
         if model_key in model_cahce:
             return model_cahce[model_key]
+        from spandrel import ModelLoader
 
         model_file = folder_paths.get_full_path("inpaint", model_name)
         if model_file is None:
@@ -326,7 +326,7 @@ class LoadInpaintModel:
         if "synthesis.first_stage.conv_first.conv.resample_filter" in sd:  # MAT
             model = mat.load(sd)
         else:
-            model = comfy_extras.chainner_models.model_loading.load_state_dict(sd)
+            model = ModelLoader().load_from_state_dict(sd)
         model = model.eval()
 
         model_cahce[model_key] = (model,)
@@ -355,18 +355,18 @@ class InpaintWithModel:
 
     def inpaint(
         self,
-        inpaint_model: PyTorchModel,
+        inpaint_model: mat.MAT | Any,
         image: Tensor,
         mask: Tensor,
         seed: int,
         optional_upscale_model=None,
     ):
-        if inpaint_model.model_arch == "MAT":
+        if isinstance(inpaint_model, mat.MAT):
             required_size = 512
-        elif inpaint_model.model_arch == "LaMa":
+        elif inpaint_model.architecture.id == "LaMa":
             required_size = 256
         else:
-            raise ValueError(f"Unknown model_arch {inpaint_model.model_arch}")
+            raise ValueError(f"Unknown model_arch {type(inpaint_model)}")
 
         if optional_upscale_model != None:
             from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
@@ -396,9 +396,7 @@ class InpaintWithModel:
 
             if optional_upscale_model != None:
                 work_image = work_image.movedim(1, -1)
-                work_image = upscaler.upscale(
-                    upscaler, optional_upscale_model, work_image
-                )
+                work_image = upscaler.upscale(upscaler, optional_upscale_model, work_image)
                 work_image = work_image[0].movedim(-1, 1)
 
             work_image.to(image_device)
