@@ -21,7 +21,10 @@ from . import mat
 from .util import (
     gaussian_blur,
     binary_erosion,
+    binary_dilation,
     make_odd,
+    mask_floor,
+    mask_unsqueeze,
     to_torch,
     to_comfy,
     resize_square,
@@ -48,9 +51,10 @@ def load_fooocus_patch(lora: dict, to_load: dict):
             loaded_keys.add(key)
 
     not_loaded = sum(1 for x in lora if x not in loaded_keys)
-    print(
-        f"[ApplyFooocusInpaint] {len(loaded_keys)} Lora keys loaded, {not_loaded} remaining keys not found in model."
-    )
+    if not_loaded > 0:
+        print(
+            f"[ApplyFooocusInpaint] {len(loaded_keys)} Lora keys loaded, {not_loaded} remaining keys not found in model."
+        )
     return patch_dict
 
 
@@ -62,7 +66,8 @@ def calculate_weight_patched(self: ModelPatcher, patches, weight, key):
     remaining = []
 
     for p in patches:
-        alpha, v, strength_model = p
+        alpha = p[0]
+        v = p[1]
 
         is_fooocus_patch = isinstance(v, tuple) and len(v) == 2 and v[0] == "fooocus"
         if not is_fooocus_patch:
@@ -145,6 +150,9 @@ class ApplyFooocusInpaint:
     CATEGORY = "inpaint"
     FUNCTION = "patch"
 
+    _inpaint_head_feature: Tensor | None = None
+    _inpaint_block: Tensor | None = None
+
     def patch(
         self,
         model: ModelPatcher,
@@ -160,19 +168,15 @@ class ApplyFooocusInpaint:
         inpaint_head_model, inpaint_lora = patch
         feed = torch.cat([latent_mask, latent_pixels], dim=1)
         inpaint_head_model.to(device=feed.device, dtype=feed.dtype)
-        inpaint_head_feature = inpaint_head_model(feed)
-
-        def input_block_patch(h, transformer_options):
-            if transformer_options["block"][1] == 0:
-                h = h + inpaint_head_feature.to(h)
-            return h
+        self._inpaint_head_feature = inpaint_head_model(feed)
+        self._inpaint_block = None
 
         lora_keys = comfy.lora.model_lora_keys_unet(model.model, {})
         lora_keys.update({x: x for x in base_model.state_dict().keys()})
         loaded_lora = load_fooocus_patch(inpaint_lora, lora_keys)
 
         m = model.clone()
-        m.set_model_input_block_patch(input_block_patch)
+        m.set_model_input_block_patch(self._input_block_patch)
         patched = m.add_patches(loaded_lora, 1.0)
 
         not_patched_count = sum(1 for x in loaded_lora if x not in patched)
@@ -181,6 +185,15 @@ class ApplyFooocusInpaint:
 
         inject_patched_calculate_weight()
         return (m,)
+
+    def _input_block_patch(self, h: Tensor, transformer_options: dict):
+        if transformer_options["block"][1] == 0:
+            if self._inpaint_block is None or self._inpaint_block.shape != h.shape:
+                assert self._inpaint_head_feature is not None
+                batch = h.shape[0] // self._inpaint_head_feature.shape[0]
+                self._inpaint_block = self._inpaint_head_feature.to(h).repeat(batch, 1, 1, 1)
+            h = h + self._inpaint_block
+        return h
 
 
 class VAEEncodeInpaintConditioning:
@@ -230,7 +243,9 @@ class MaskedFill:
 
     def fill(self, image: Tensor, mask: Tensor, fill: str, falloff: int):
         image = image.detach().clone()
-        alpha = mask.expand(1, *mask.shape[-2:]).floor()
+        alpha = mask_unsqueeze(mask_floor(mask))
+        assert alpha.shape[0] == image.shape[0], "Image and mask batch size does not match"
+
         falloff = make_odd(falloff)
         if falloff > 0:
             erosion = binary_erosion(alpha, falloff)
@@ -246,9 +261,9 @@ class MaskedFill:
             import cv2
 
             method = cv2.INPAINT_TELEA if fill == "telea" else cv2.INPAINT_NS
-            alpha_np = alpha.squeeze(0).cpu().numpy()
-            alpha_bc = alpha_np.reshape(*alpha_np.shape, 1)
-            for slice in image:
+            for slice, alpha_slice in zip(image, alpha):
+                alpha_np = alpha_slice.squeeze().cpu().numpy()
+                alpha_bc = alpha_np.reshape(*alpha_np.shape, 1)
                 image_np = slice.cpu().numpy()
                 filled_np = cv2.inpaint(
                     (255.0 * image_np).astype(np.uint8),
@@ -285,11 +300,11 @@ class MaskedBlur:
         image, mask = to_torch(image, mask)
 
         original = image.clone()
-        alpha = mask.floor()
+        alpha = mask_floor(mask)
         if falloff > 0:
             erosion = binary_erosion(alpha, falloff)
             alpha = alpha * gaussian_blur(erosion, falloff)
-        alpha = alpha.repeat(1, 3, 1, 1)
+        alpha = alpha.expand(-1, 3, -1, -1)
 
         image = gaussian_blur(image, blur)
         image = original + (image - original) * alpha
@@ -389,7 +404,7 @@ class InpaintWithModel:
             work_image, work_mask, original_size = resize_square(
                 work_image, work_mask, required_size
             )
-            work_mask = work_mask.floor()
+            work_mask = mask_floor(work_mask)
 
             torch.manual_seed(seed)
             work_image = inpaint_model(work_image.to(device), work_mask.to(device))
@@ -401,7 +416,7 @@ class InpaintWithModel:
 
             work_image.to(image_device)
             work_image = undo_resize_square(work_image.to(image_device), original_size)
-            work_image = image[i] + (work_image - image[i]) * mask[i].floor()
+            work_image = image[i] + (work_image - image[i]) * mask_floor(mask[i])
 
             batch_image.append(work_image)
             pbar.update(1)
@@ -437,3 +452,27 @@ class DenoiseToCompositingMask:
         mask = (mask - offset) * (1 / (threshold - offset))
         mask = mask.clamp(0, 1)
         return (mask,)
+
+
+class ExpandMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "grow": ("INT", {"default": 16, "min": 0, "max": 8096, "step": 1}),
+                "blur": ("INT", {"default": 7, "min": 0, "max": 8096, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    CATEGORY = "inpaint"
+    FUNCTION = "expand"
+
+    def expand(self, mask: Tensor, grow: int, blur: int):
+        mask = mask_unsqueeze(mask)
+        if grow > 0:
+            mask = binary_dilation(mask, grow)
+        if blur > 0:
+            mask = gaussian_blur(mask, make_odd(blur))
+        return (mask.squeeze(1),)
