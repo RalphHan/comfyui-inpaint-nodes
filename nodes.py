@@ -129,7 +129,7 @@ class LoadFooocusInpaint:
 
         head_file = folder_paths.get_full_path("inpaint", head)
         inpaint_head_model = InpaintHead()
-        sd = torch.load(head_file, map_location="cpu")
+        sd = torch.load(head_file, map_location="cpu", weights_only=True)
         inpaint_head_model.load_state_dict(sd)
 
         patch_file = folder_paths.get_full_path("inpaint", patch)
@@ -220,9 +220,14 @@ class VAEEncodeInpaintConditioning:
     CATEGORY = "inpaint"
 
     def encode(self, positive, negative, vae, pixels, mask):
-        positive, negative, latent = nodes.InpaintModelConditioning().encode(
-            positive, negative, pixels, vae, mask
-        )
+        try:
+            positive, negative, latent = nodes.InpaintModelConditioning().encode(
+                positive, negative, pixels, vae, mask, add_noise_mask=True
+            )
+        except TypeError:  # ComfyUI versions older than 2024-11-19
+            positive, negative, latent = nodes.InpaintModelConditioning().encode(
+                positive, negative, pixels, vae, mask
+            )
         latent_inpaint = dict(
             samples=positive[0][1]["concat_latent_image"],
             noise_mask=latent["noise_mask"].round(),
